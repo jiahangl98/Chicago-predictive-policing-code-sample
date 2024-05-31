@@ -1,0 +1,1249 @@
+---
+title: "Geospatial Risk Predictions of Gun Violence in Chicago"
+author: "Jiahang Li"
+date: "2024-4-3"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+    cache: true
+---
+
+<style type="text/css">
+
+body{ /* Normal  */
+      font-size: 19px;
+  }
+td {  /* Table  */
+  font-size: 19px;
+}
+h1.title {
+  font-size: 38px;
+  color: DarkYellow;
+}
+h1 { /* Header 1 */
+  font-size: 40px;
+  color: DarkBlue;
+}
+h2 { /* Header 2 */
+    font-size: 25px;
+  color: DarkBlue;
+}
+h3 { /* Header 3 */
+  font-size: 24px;
+  color: DarkBlue;
+}
+code.r{ /* Code block */
+    font-size: 12px;
+    color: #BB3754;
+}
+pre { /* Code block - determines code spacing between lines */
+    font-size: 14px;
+    color: #BB3754;
+}
+</style>
+
+
+# Introduction
+
+Machine learning algorithms are trained to identify relationships and patterns within data. They use historical data as input to predict outcomes, classify information, cluster data points, and reduce dimensionality. One common usage of machine learning is predictive policing. For the purpose of crime prediction, the model gathers different types of data, such as historical crime data, sociological factors, economic factors, and spatial characteristics, to provide a more accurate prediction for police departments to allocate and optimize resource deployment efficiently.
+
+
+Although the models will provide a prediction for police enforcement to reference their strategies allocation, there are unavoidable biases within the models. If the region has more population and commercial corridors within the area, it will have a higher tendency of crime than surrounding rural areas. Thus, more resource deployment will be planted in the dense crime areas, whereas the allocation of resources will be in the surrounding rural areas. Other factors like racial discrimination and past policy issues will also result in the same situation, where biased data will be collected from historical data to introduce these flaws into the prediction model. 
+
+Furthermore, data inflation in the denser crime areas will not be refined. The infinite loop will be created for police departments to constantly add more police resources in the denser crime areas, which may lead to disproportional targeting of specific communities.
+
+The goal of this project is to develop a geospatial risk model for predicting crime incidents, especially gun violence in the city of Chicago based on the 2018 data from Open data chicago. All types of crime are under circumstances that some crime incidents will not be reported due to different type of reasons and higher frequency of patrolling will result in more report of crime incidents. Therefore, the model assumes the more proximity or exposure to crime risks will result in higher crime risks. Our model utilized Poisson regression to reflect the count nature of crime incidents.
+
+The analysis follows this structure: an examination of gun violences, rationale for selecting risk factors, feature engineering including distance calculations and hotspot identification, fitting of Poisson regression models (a simple model and one accounting for spatial attributes), cross-validation (random k-fold and spatial leave-one-out), and a comparison of model errors and generalizability. Lastly, we contrast our predictive models with Kernel Density Estimation to evaluate their efficacy.
+
+
+
+```{r cache = TRUE, warning = FALSE, message = FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE)
+
+library(tidyverse)
+library(sf)
+library(dplyr)
+library(RSocrata)
+library(viridis)
+library(spatstat)
+library(raster)
+library(spdep)
+library(FNN)
+library(grid)
+library(gridExtra)
+library(knitr)
+library(kableExtra)
+library(tidycensus)
+library(classInt)   # for KDE and ML risk class intervals
+library(patchwork)
+# functions
+root.dir = "https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/DATA/"
+source("https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/functions.r")
+
+```
+
+
+# Data Wrangling
+
+I first downloaded the 2018 crime data from The Chicago Data Portal, which is an online platform that serves as a central repository for a wide range of municipal data sets. The portal maintains a record for crime incidents for Chicago every year. After downloading, I filtered out the gun violence data. The resulting field is then converted to separate fields of X and Y coordinates.
+
+```{r cache = TRUE, warning = FALSE, message = FALSE,results='hide'}
+# Read and process police districts data
+policeDistricts <- 
+  st_read("https://data.cityofchicago.org/api/geospatial/fthy-xz3r?method=export&format=GeoJSON") %>%
+  st_transform('ESRI:102271') %>%  # Transform coordinate reference system
+  dplyr::select(District = dist_num)  # Select only the district number, renaming it to 'District'
+
+# Read and process police beats data
+policeBeats <- 
+  st_read("https://data.cityofchicago.org/api/geospatial/aerh-rz74?method=export&format=GeoJSON") %>%
+  st_transform('ESRI:102271') %>%  # Transform coordinate reference system
+  dplyr::select(District = beat_num)  # Select only the beat number, renaming it to 'District'
+
+# Combine police districts and beats data into one dataframe
+bothPoliceUnits <- rbind(
+  mutate(policeDistricts, Legend = "Police Districts"),  # Add a 'Legend' column and label for police districts
+  mutate(policeBeats, Legend = "Police Beats")  # Add a 'Legend' column and label for police beats
+)
+
+
+# Read the CSV file into an R data frame
+crime_data <- read.csv("C:/Users/jiahangl/OneDrive - PennO365/MUSA508/A4/crime2018.csv")
+crime_data <- crime_data %>%
+  filter(!is.na(Longitude) & !is.na(Latitude))
+
+# Convert the data frame to an sf object, specifying longitude and latitude for coordinates
+# Assuming your CSV has columns named Longitude and Latitude
+gun18 <- st_as_sf(crime_data, coords = c("Longitude", "Latitude"), crs = 4326)%>%
+st_transform('ESRI:102271') 
+
+
+# Read and process Chicago boundary data
+chicagoBoundary <- 
+  st_read(file.path(root.dir, "/Chapter5/chicagoBoundary.geojson")) %>%  # Read Chicago boundary data
+  st_transform('ESRI:102271')  # Transform coordinate reference system
+
+```
+
+## Gun violence pattern
+
+The following map visualizes each individual gun violence incident in Chicago in 2018. It reveals that gun violence are slightly more concentrated in central and southeast Chicago.
+
+
+```{r cache = TRUE, warning = FALSE, message = FALSE}
+# Uses grid.arrange to organize independent plots
+
+  
+  # Plot 1: Burglaries overlaid on Chicago boundary
+  ggplot() + 
+    geom_sf(data = chicagoBoundary, fill = "black") +  # Add Chicago boundary
+    geom_sf(data = gun18, colour = "yellow", size = 0.1, show.legend = "point") +  # Overlay burglaries
+    labs(title = "Gun violence, Chicago - 2018") +  # Set plot title
+    theme_void()  # Use a blank theme
+  
+
+```
+
+
+The density map further visualizes this pattern. There are two major gun violence hotspots, which should be given special attention.
+
+
+```{r cache = TRUE, warning = FALSE, message = FALSE}
+# Uses grid.arrange to organize independent plots
+
+  # Plot 2: Density of burglaries with contours overlaid on Chicago boundary
+  ggplot() + 
+    geom_sf(data = chicagoBoundary, fill = "black") +  # Add Chicago boundary with grey fill
+    stat_density2d(data = data.frame(st_coordinates(gun18)),  # Compute 2D kernel density estimate
+                   aes(X, Y, fill = ..level.., alpha = ..level..),  # Define aesthetics for density contours
+                   size = 0.01, bins = 60, geom = 'polygon') +  # Set size and number of bins for contours
+    scale_fill_viridis(option = "viridis", name = "Density") +  # Use viridis color scale for fill
+    scale_alpha(range = c(0.00, 0.35), guide = FALSE) +  # Set transparency range for contours
+    labs(title = "Density of gun violence") +  # Set plot title
+    theme_void() # Use a blank theme and remove legend
+
+
+```
+
+
+```{r cache = TRUE, warning = FALSE, message = FALSE}
+## using {sf} to create the grid
+## Note the `.[chicagoBoundary] %>% ` line. This is needed to clip the grid to our data
+fishnet <- 
+st_make_grid(chicagoBoundary,
+               cellsize = 500, 
+               square = TRUE) %>%
+  .[chicagoBoundary] %>%            # fast way to select intersecting polygons
+  st_sf() %>%   mutate(uniqueID = 1:n())
+
+ggplot() +
+  geom_sf(data=fishnet, color="black", fill="grey") +
+  labs(title = "Fishnet of Chicago") +
+  theme(axis.text.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks =element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        plot.subtitle = element_text(size = 9,face = "italic"),
+        plot.title = element_text(size = 12, face = "bold"),
+        panel.background = element_blank()
+        )
+
+
+```
+
+## Aggregate points to the fishnet
+
+
+To calculate the number of gun violence within each grid cell, initiate by creating a new attribute, countgunviolence, assigning a value of one for each gun violence occurrence. Then, I perform a spatial join to merge the gun violence points with the predefined grid, termed as 'fishnet', summarizing the countgunviolence within each grid cell through summation. For grid cells devoid of any gun violence incidents, their count will be marked as NA, which should then be converted to 0 using the replace_na function. Additionally, I assign a unique identifier, uniqueID, to each grid cell and generate a random grouping variable, cvID, to be utilized in subsequent cross-validation steps. 
+
+The following map depicts the distribution of gun violence counts across the grid cells, thereby revealing the patterned spatial distribution of gun violence incidents. 
+
+```{r cache = TRUE, warning = FALSE, message = FALSE}
+## add a value of 1 to each crime, sum them with aggregate
+crime_net <- 
+  dplyr::select(gun18) %>% 
+  mutate(countgunviolence = 1) %>% 
+  aggregate(., fishnet, sum) %>%
+  mutate(countgunviolence = replace_na(countgunviolence, 0),
+         uniqueID = 1:n(),
+         cvID = sample(round(nrow(fishnet) / 24), 
+                       size=nrow(fishnet), replace = TRUE))
+
+ggplot() +
+  geom_sf(data = crime_net, aes(fill = countgunviolence), color = NA) +
+   scale_fill_viridis(option = "viridis", name = "Count of Gun violence") +
+  labs(title = "Count of Gun Violence for the fishnet") +
+  theme_void()
+
+```
+
+
+
+The figure below shows the distribution of gun violence in Chicago, which is non-normally distributed with a few grids having significantly higher number of robberies. To account for this non-normality, it is necessary to use Possion regression for this analysis.
+
+
+```{r cache = TRUE, warning = FALSE, message = FALSE}
+ggplot(crime_net, aes(x = countgunviolence)) +
+  geom_histogram( fill="#56106E", color="#e9ecef") + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  theme(plot.subtitle = element_text(size = 9,face = "italic"),
+        plot.title = element_text(size = 12, face = "bold"), 
+        axis.text.x=element_text(size=6),
+        axis.text.y=element_text(size=6), 
+        axis.title=element_text(size=8), 
+        panel.background = element_blank(),
+        panel.border = element_rect(colour = "grey", fill=NA, size=0.8)) + 
+  labs(title = "Distribution of Gun Violence in Chicago 2018",
+       caption = "Data: Chicago Data Portal Crimes 2018") +
+  xlab("Gun Violence") +
+  ylab("Count")
+
+```
+
+## Risk Factors
+
+We included in our model eight different risk factors. This includes 311 reports of abandoned cars, street lights out, graffiti remediation, sanitation complaints, abandon buildings, location of retail stores that sell liquor to go, location of shotspotter, and location of potholes. We include them out of the following considerations.
+
+**Abandoned Cars:** Communities characterized by a high prevalence of abandoned vehicles may signal economic hardship, diminished community involvement, and reduced surveillance levels. Such circumstances can foster an atmosphere that is more susceptible to criminal behaviors, including gun violence.
+
+**Street Lights Out: ** Poorly lit areas are often targeted by criminals because darkness provides cover. Reports of street lights out can highlight areas with reduced visibility, making them potential hotspots for gun violence.
+
+**Graffiti Presence:** Regions marked by prevalent graffiti may indicate insufficient community upkeep and supervision. These areas, often viewed as overlooked, can become hotspots for criminal behavior, such as gun violence.
+
+**Sanitation Complaints:** Communities facing sanitation challenges often reflect a neglect in upkeep and maintenance. This decay in communal integrity can lead to conditions that are more permissive of criminal acts, including gun violence.
+
+**Abandoned Buildings:** Abandoned buildings often become havens for criminal activity and can be seen as unsafe by the community. They contribute to a feeling of disarray and can draw in criminal elements, thereby increasing the vulnerability of surrounding areas to gun violence.
+
+**Retail Stores Selling Liquor to Go: ** Liquor stores are associated with alcohol consumption. Areas with a high concentration of liquor stores might indicate higher lead to higher alcohol related crime (though this is a very subjective statement) because inebriated individuals, particularly during late hours, might be more vulnerable and less aware of their surroundings, making them easy targets for gun crime.
+
+**Location of ShotSpotter:**  ShotSpotter technology, which captures gunfire incidents in real-time, indicates that areas with frequent gunshot occurrences often face elevated crime rates, including instances of robbery. Such locations can be identified as potential risk indicators for forecasting gun violence incidents.
+
+**Pot Holes:**  Areas with significant infrastructure problems, like potholes, can see a decrease in economic activity. Businesses may be less likely to invest in these areas, leading to higher unemployment rates and potentially more crime as a result of economic desperation.
+
+
+```{r cache = TRUE, warning = FALSE, message = FALSE}
+abandonCars <- 
+  read.socrata("https://data.cityofchicago.org/Service-Requests/311-Service-Requests-Abandoned-Vehicles/3c9v-pnva") %>%
+    mutate(year = substr(creation_date,1,4)) %>% filter(year == "2018") %>%
+    dplyr::select(Y = latitude, X = longitude) %>%
+    na.omit() %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+    st_transform(st_crs(fishnet)) %>%
+    mutate(Legend = "Abandoned_Cars")
+  
+abandonBuildings <- 
+  read.socrata("https://data.cityofchicago.org/Service-Requests/311-Service-Requests-Vacant-and-Abandoned-Building/7nii-7srd") %>%
+    mutate(year = substr(date_service_request_was_received,1,4)) %>%  filter(year == "2018") %>%
+    dplyr::select(Y = latitude, X = longitude) %>%
+    na.omit() %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+    st_transform(st_crs(fishnet)) %>%
+    mutate(Legend = "Abandoned_Buildings")
+
+graffiti <- 
+  read.socrata("https://data.cityofchicago.org/Service-Requests/311-Service-Requests-Graffiti-Removal-Historical/hec5-y4x5") %>%
+    mutate(year = substr(creation_date,1,4)) %>% filter(year == "2018") %>%
+    filter(where_is_the_graffiti_located_ %in% c("Front", "Rear", "Side")) %>%
+    dplyr::select(Y = latitude, X = longitude) %>%
+    na.omit() %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+    st_transform(st_crs(fishnet)) %>%
+    mutate(Legend = "Graffiti")
+
+streetLightsOut <- 
+  read.socrata("https://data.cityofchicago.org/Service-Requests/311-Service-Requests-Street-Lights-All-Out/zuxi-7xem") %>%
+    mutate(year = substr(creation_date,1,4)) %>% filter(year == "2018") %>%
+    dplyr::select(Y = latitude, X = longitude) %>%
+    na.omit() %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+    st_transform(st_crs(fishnet)) %>%
+    mutate(Legend = "Street_Lights_Out")
+
+sanitation <-
+  read.socrata("https://data.cityofchicago.org/Service-Requests/311-Service-Requests-Sanitation-Code-Complaints-Hi/me59-5fac") %>%
+    mutate(year = substr(creation_date,1,4)) %>% filter(year == "2018") %>%
+    dplyr::select(Y = latitude, X = longitude) %>%
+    na.omit() %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+    st_transform(st_crs(fishnet)) %>%
+    mutate(Legend = "Sanitation")
+
+liquorRetail <- 
+  read.socrata("https://data.cityofchicago.org/resource/nrmj-3kcf.json") %>%  
+    filter(business_activity == "Retail Sales of Packaged Liquor") %>%
+    dplyr::select(Y = latitude, X = longitude) %>%
+    na.omit() %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+    st_transform(st_crs(fishnet)) %>%
+    mutate(Legend = "Liquor_Retail")
+
+
+shotSpotter <- 
+  read.socrata("https://data.cityofchicago.org/Public-Safety/Violence-Reduction-Shotspotter-Alerts/3h7q-7mdb") %>%  
+    dplyr::select(Y = latitude, X = longitude) %>%
+    na.omit() %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+    st_transform(st_crs(fishnet)) %>%
+    mutate(Legend = "Shot_Spotter")
+
+# selected new features from open data Chicago.
+PotHoles <- 
+  read.socrata("https://data.cityofchicago.org/Service-Requests/311-Service-Requests-Pot-Holes-Reported-No-Duplica/bp3e-nw4d") %>%
+  mutate(year = substr(CREATION.DATE,1,4)) %>% filter(year == "2018") %>%
+  dplyr::select(Y = LATITUDE, X = LONGITUDE) %>%
+  na.omit() %>%
+  st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+  st_transform(st_crs(fishnet)) %>%
+  mutate(Legend = "Pot_Holes")
+```
+
+```{r cache = TRUE, message = FALSE, warning = FALSE}
+vars_net <- 
+  rbind(abandonCars,streetLightsOut,abandonBuildings,
+        liquorRetail, graffiti, sanitation, shotSpotter, PotHoles) %>%
+  st_join(., fishnet, join=st_within) %>%
+  st_drop_geometry() %>%
+  group_by(uniqueID, Legend) %>%
+  summarize(count = n()) %>%
+    full_join(fishnet) %>%
+    spread(Legend, count, fill=0) %>%
+    st_sf() %>%
+    dplyr::select(-`<NA>`) %>%
+    na.omit() %>%
+    ungroup()
+```
+
+
+```{r cache = TRUE, message = FALSE, warning = FALSE}
+
+vars_net.long <- 
+  gather(vars_net, Variable, value, -geometry, -uniqueID)
+
+plot1 <- ggplot() +
+  geom_sf(data = vars_net.long %>% filter(Variable == "Abandoned_Buildings"), aes(fill=value), colour=NA) +
+  scale_fill_viridis(option = "viridis") + 
+  labs(title = "Abandoned Buildings") +
+  theme(axis.text.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks =element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        plot.subtitle = element_text(size = 9,face = "italic"),
+        plot.title = element_text(size = 10, face = "bold"),
+        panel.background = element_blank(),
+        panel.border = element_rect(colour = "grey", fill=NA, size=0.8)
+        )
+
+
+plot2 <- ggplot() +
+  geom_sf(data = vars_net.long %>% filter(Variable == "Abandoned_Cars"), aes(fill=value), colour=NA) +
+  scale_fill_viridis(option = "viridis") + 
+  labs(title = "Abandoned Cars") +
+  theme(axis.text.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks =element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        plot.subtitle = element_text(size = 9,face = "italic"),
+        plot.title = element_text(size = 10, face = "bold"),
+        panel.background = element_blank(),
+        panel.border = element_rect(colour = "grey", fill=NA, size=0.8)
+        )
+
+plot3 <- ggplot() +
+  geom_sf(data = vars_net.long %>% filter(Variable == "Pot_Holes"), aes(fill=value), colour=NA) +
+  scale_fill_viridis(option = "viridis") + 
+  labs(title = "PotHoles") +
+  theme(axis.text.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks =element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        plot.subtitle = element_text(size = 9,face = "italic"),
+        plot.title = element_text(size = 10, face = "bold"),
+        panel.background = element_blank(),
+        panel.border = element_rect(colour = "grey", fill=NA, size=0.8)
+        )
+
+plot4 <- ggplot() +
+  geom_sf(data = vars_net.long %>% filter(Variable == "Graffiti"), aes(fill=value), colour=NA) +
+  scale_fill_viridis(option = "viridis") + 
+  labs(title = "Graffiti") +
+  theme(axis.text.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks =element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        plot.subtitle = element_text(size = 9,face = "italic"),
+        plot.title = element_text(size = 10, face = "bold"),
+        panel.background = element_blank(),
+        panel.border = element_rect(colour = "grey", fill=NA, size=0.8)
+        )
+
+
+plot5 <- ggplot() +
+  geom_sf(data = vars_net.long %>% filter(Variable == "Liquor_Retail"), aes(fill=value), colour=NA) +
+  scale_fill_viridis(option = "viridis") + 
+  labs(title = "Liquor Retail") +
+  theme(axis.text.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks =element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        plot.subtitle = element_text(size = 9,face = "italic"),
+        plot.title = element_text(size = 10, face = "bold"),
+        panel.background = element_blank(),
+        panel.border = element_rect(colour = "grey", fill=NA, size=0.8)
+        )
+
+plot6 <- ggplot() +
+  geom_sf(data = vars_net.long %>% filter(Variable == "Sanitation"), aes(fill=value), colour=NA) +
+  scale_fill_viridis(option = "viridis") + 
+  labs(title = "Sanitation") +
+  theme(axis.text.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks =element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        plot.subtitle = element_text(size = 9,face = "italic"),
+        plot.title = element_text(size = 10, face = "bold"),
+        panel.background = element_blank(),
+        panel.border = element_rect(colour = "grey", fill=NA, size=0.8)
+        )
+
+plot7 <- ggplot() +
+  geom_sf(data = vars_net.long %>% filter(Variable == "Shot_Spotter"), aes(fill=value), colour=NA) +
+  scale_fill_viridis(option = "viridis") + 
+  labs(title = "Shot Spotter") +
+  theme(axis.text.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks =element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        plot.subtitle = element_text(size = 9,face = "italic"),
+        plot.title = element_text(size = 10, face = "bold"),
+        panel.background = element_blank(),
+        panel.border = element_rect(colour = "grey", fill=NA, size=0.8)
+        )
+
+
+plot8 <- ggplot() +
+  geom_sf(data = vars_net.long %>% filter(Variable == "Street_Lights_Out"), aes(fill=value), colour=NA) +
+  scale_fill_viridis(option = "viridis") + 
+  labs(title = "Street Light Out") +
+  theme(axis.text.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks =element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        plot.subtitle = element_text(size = 9,face = "italic"),
+        plot.title = element_text(size = 10, face = "bold"),
+        panel.background = element_blank(),
+        panel.border = element_rect(colour = "grey", fill=NA, size=0.8)
+        )
+
+wrap_plots(
+  plot1, plot3, plot2, plot4,
+  plot5, plot6, plot7, plot8,
+  ncol = 4  
+)
+```
+
+
+# Feature Engineering
+
+## Nearest Neighbor Feature
+
+We calculate the average nearest-neighbor distance to assume the exposed geospatial risks in the city of Chicago. The nn_function here defines the three nearest neighbors of the centroids of fishnet grid cells. 
+
+The nearest neighbors are shown below. Higher values represent denser features in the city of Chicago. For instance, in the context of “shot spotter,” northeast Chicago experienced denser shooting incidents since this part of the region has a wide area of high (bright) values.
+
+
+```{r cache = TRUE, warning = FALSE, message = FALSE}
+st_c <- st_coordinates
+st_coid <- st_centroid
+
+vars_net <-
+  vars_net %>%
+    mutate(
+      Abandoned_Buildings.nn =
+        nn_function(st_c(st_coid(vars_net)), st_c(abandonBuildings),3),
+      Abandoned_Cars.nn =
+        nn_function(st_c(st_coid(vars_net)), st_c(abandonCars),3),
+      Graffiti.nn =
+        nn_function(st_c(st_coid(vars_net)), st_c(graffiti),3),
+      Liquor_Retail.nn =
+        nn_function(st_c(st_coid(vars_net)), st_c(liquorRetail),3),
+      Street_Lights_Out.nn =
+        nn_function(st_c(st_coid(vars_net)), st_c(streetLightsOut),3),
+      Sanitation.nn =
+        nn_function(st_c(st_coid(vars_net)), st_c(sanitation),3),
+      Pot_Holes.nn =
+        nn_function(st_c(st_coid(vars_net)), st_c(PotHoles),3),
+       Shot_Spotter.nn =
+        nn_function(st_c(st_coid(vars_net)), st_c(shotSpotter),3))
+
+```
+
+
+```{r cache = TRUE, warning = FALSE, message = FALSE}
+## Visualize the NN feature
+vars_net.long.nn <- 
+  dplyr::select(vars_net, ends_with(".nn")) %>%
+    gather(Variable, value, -geometry)
+
+
+p1.nn <- ggplot() +
+  geom_sf(data = vars_net.long.nn %>% filter(Variable == "Abandoned_Buildings.nn"), aes(fill=value), colour=NA) +
+  scale_fill_viridis(option = "viridis") + 
+  labs(title = "Abandoned Buildings NN") +
+  theme(axis.text.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks =element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        plot.subtitle = element_text(size = 5,face = "italic"),
+        plot.title = element_text(size = 7, face = "bold"),
+        panel.background = element_blank(),
+        panel.border = element_rect(colour = "grey", fill=NA, size=0.8),
+          legend.title = element_text(size = 5), # Adjust the size here for the legend title
+        legend.text = element_text(size = 5) # Adjust the size here for the legend text
+        )
+
+
+p2.nn <- ggplot() +
+  geom_sf(data = vars_net.long.nn %>% filter(Variable == "Abandoned_Cars.nn"), aes(fill=value), colour=NA) +
+  scale_fill_viridis(option = "viridis") + 
+  labs(title = "Abandoned Cars NN") +
+  theme(axis.text.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks =element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        plot.subtitle = element_text(size = 9,face = "italic"),
+        plot.title = element_text(size = 7, face = "bold"),
+        panel.background = element_blank(),
+        panel.border = element_rect(colour = "grey", fill=NA, size=0.8),
+          legend.title = element_text(size = 5), # Adjust the size here for the legend title
+        legend.text = element_text(size = 5) # Adjust the size here for the legend text
+        )
+
+p3.nn <- ggplot() +
+  geom_sf(data = vars_net.long.nn %>% filter(Variable == "Pot_Holes.nn"), aes(fill=value), colour=NA) +
+  scale_fill_viridis(option = "viridis") + 
+  labs(title = "Pot Holes NN") +
+  theme(axis.text.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks =element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        plot.subtitle = element_text(size = 9,face = "italic"),
+        plot.title = element_text(size = 7, face = "bold"),
+        panel.background = element_blank(),
+        panel.border = element_rect(colour = "grey", fill=NA, size=0.8),
+          legend.title = element_text(size = 5), # Adjust the size here for the legend title
+        legend.text = element_text(size = 5) # Adjust the size here for the legend text
+        )
+
+p4.nn <- ggplot() +
+  geom_sf(data = vars_net.long.nn %>% filter(Variable == "Graffiti.nn"), aes(fill=value), colour=NA) +
+  scale_fill_viridis(option = "viridis") + 
+  labs(title = "Graffiti NN") +
+  theme(axis.text.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks =element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        plot.subtitle = element_text(size = 9,face = "italic"),
+        plot.title = element_text(size = 7, face = "bold"),
+        panel.background = element_blank(),
+        panel.border = element_rect(colour = "grey", fill=NA, size=0.8),
+          legend.title = element_text(size = 5), # Adjust the size here for the legend title
+        legend.text = element_text(size = 5) # Adjust the size here for the legend text
+        )
+
+
+p5.nn <- ggplot() +
+  geom_sf(data = vars_net.long.nn %>% filter(Variable == "Liquor_Retail.nn"), aes(fill=value), colour=NA) +
+  scale_fill_viridis(option = "viridis") + 
+  labs(title = "Liquor Retail NN") +
+  theme(axis.text.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks =element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        plot.subtitle = element_text(size = 9,face = "italic"),
+        plot.title = element_text(size = 7, face = "bold"),
+        panel.background = element_blank(),
+        panel.border = element_rect(colour = "grey", fill=NA, size=0.8),
+          legend.title = element_text(size = 5), # Adjust the size here for the legend title
+        legend.text = element_text(size = 5) # Adjust the size here for the legend text
+        )
+
+p6.nn <- ggplot() +
+  geom_sf(data = vars_net.long.nn %>% filter(Variable == "Sanitation.nn"), aes(fill=value), colour=NA) +
+  scale_fill_viridis(option = "viridis") + 
+  labs(title = "Sanitation NN") +
+  theme(axis.text.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks =element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        plot.subtitle = element_text(size = 9,face = "italic"),
+        plot.title = element_text(size = 7, face = "bold"),
+        panel.background = element_blank(),
+        panel.border = element_rect(colour = "grey", fill=NA, size=0.8),
+          legend.title = element_text(size = 5), # Adjust the size here for the legend title
+        legend.text = element_text(size = 5) # Adjust the size here for the legend text
+        )
+
+p7.nn <- ggplot() +
+  geom_sf(data = vars_net.long.nn %>% filter(Variable == "Shot_Spotter.nn"), aes(fill=value), colour=NA) +
+  scale_fill_viridis(option = "viridis") + 
+  labs(title = "Shot Spotter NN") +
+  theme(axis.text.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks =element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        plot.subtitle = element_text(size = 9,face = "italic"),
+        plot.title = element_text(size = 7, face = "bold"),
+        panel.background = element_blank(),
+        panel.border = element_rect(colour = "grey", fill=NA, size=0.8),
+          legend.title = element_text(size = 5), # Adjust the size here for the legend title
+        legend.text = element_text(size = 5) # Adjust the size here for the legend text
+        )
+
+
+p8.nn <- ggplot() +
+  geom_sf(data = vars_net.long.nn %>% filter(Variable == "Street_Lights_Out.nn"), aes(fill=value), colour=NA) +
+  scale_fill_viridis(option = "viridis") + 
+  labs(title = "Street Light Out NN") +
+  theme(axis.text.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks =element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        plot.subtitle = element_text(size = 9,face = "italic"),
+        plot.title = element_text(size = 7, face = "bold"),
+        panel.background = element_blank(),
+        panel.border = element_rect(colour = "grey", fill=NA, size=0.8),
+          legend.title = element_text(size = 5), # Adjust the size here for the legend title
+        legend.text = element_text(size = 5) # Adjust the size here for the legend text
+        )
+
+wrap_plots(
+  p1.nn, p3.nn, p2.nn, p4.nn,
+  p5.nn, p6.nn, p7.nn, p8.nn,
+  ncol = 4  
+)
+```
+
+## Local Spatial Autocorrelation
+
+The similarity between the Local Moran's I statistic and the Global Moran's I (if there’s a significant effect across the entire study area) is that they all provide value to indicate how similar locations they are compared to the surrounding areas. However, the difference is that each segmented location, i, receives its own I value, as well as its own variance, z value, expected I, and variance of I. The argument “queen = T” indicates that it counts for every adjacent area.
+
+Higher local moran’s I value indicates that the feature and its neighbors have the same value, which is also identified as a hot spot. If the area has a lower local moran’s I value means that this area and its neighbors have zero or negative autocorrelation, which means that the feature and its neighbors have opposite or non-related values. 
+
+
+```{r cache = TRUE, warning = FALSE, message = FALSE}
+final_net <-
+  left_join(crime_net, st_drop_geometry(vars_net), by="uniqueID")
+final_net.nb <- poly2nb(as_Spatial(final_net), queen=TRUE)
+final_net.weights <- nb2listw(final_net.nb, style="W", zero.policy=TRUE)
+
+local_morans <- localmoran(final_net$countgunviolence, final_net.weights, zero.policy=TRUE) %>% 
+  as.data.frame()
+
+final_net.localMorans <- 
+  cbind(local_morans, as.data.frame(final_net)) %>% 
+  st_sf() %>%
+  dplyr::select(Gunviolence_Count = countgunviolence, 
+                Local_Morans_I = Ii, 
+                P_Value = `Pr(z != E(Ii))`) %>%
+  mutate(Significant_Hotspots = ifelse(P_Value <= 0.001, 1, 0)) %>%
+  gather(Variable, Value, -geometry)
+```
+
+
+
+
+```{r cache = TRUE, warning = FALSE, message = FALSE}
+moran1 <- ggplot() +
+  geom_sf(data = final_net.localMorans %>% filter(Variable == "Gunviolence_Count"), aes(fill=Value), colour=NA) +
+  scale_fill_viridis(option = "viridis") + 
+  labs(title = "Gun Violence Count") +
+  theme(axis.text.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks =element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        plot.subtitle = element_text(size = 9,face = "italic"),
+        plot.title = element_text(size = 10, face = "bold"),
+        panel.background = element_blank(),
+        panel.border = element_rect(colour = "grey", fill=NA, size=0.8)
+        )
+
+moran2 <- ggplot() +
+  geom_sf(data = final_net.localMorans %>% filter(Variable == "Local_Morans_I"), aes(fill=Value), colour=NA) +
+  scale_fill_viridis(option = "viridis") + 
+  labs(title = "Local Morans I") +
+  theme(axis.text.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks =element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        plot.subtitle = element_text(size = 9,face = "italic"),
+        plot.title = element_text(size = 10, face = "bold"),
+        panel.background = element_blank(),
+        panel.border = element_rect(colour = "grey", fill=NA, size=0.8)
+        )
+
+moran3 <- ggplot() +
+  geom_sf(data = final_net.localMorans %>% filter(Variable == "P_Value"), aes(fill=Value), colour=NA) +
+  scale_fill_viridis(option = "viridis") + 
+  labs(title = "P Value") +
+  theme(axis.text.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks =element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        plot.subtitle = element_text(size = 9,face = "italic"),
+        plot.title = element_text(size = 10, face = "bold"),
+        panel.background = element_blank(),
+        panel.border = element_rect(colour = "grey", fill=NA, size=0.8)
+        )
+
+
+moran4 <- ggplot() +
+  geom_sf(data = final_net.localMorans %>% filter(Variable == "Significant_Hotspots"), aes(fill=Value), colour=NA) +
+  scale_fill_viridis(option = "viridis") + 
+  labs(title = "Signigicant Hotspots") +
+  theme(axis.text.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks =element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        plot.subtitle = element_text(size = 9,face = "italic"),
+        plot.title = element_text(size = 10, face = "bold"),
+        panel.background = element_blank(),
+        panel.border = element_rect(colour = "grey", fill=NA, size=0.8)
+        )
+
+moran1 + moran2 + moran3 + moran4
+```
+
+
+## Significant GunViolence Clusters
+
+The gun violence clusters map below shows the spatial distribution of distances between each fishnet grid cell to the nearest violence hotspot.
+
+```{r cache = TRUE, warning = FALSE, message = FALSE}
+final_net <-
+  final_net %>% 
+  mutate(gunviolence.isSig = ifelse(localmoran(final_net$countgunviolence, 
+                             final_net.weights)[,5] <= 0.0000001, 1, 0)) %>%
+  mutate(gunviolence.isSig.dist = nn_function(st_coordinates(st_centroid(final_net)),
+                                          st_coordinates(st_centroid(
+                                            filter(final_net, gunviolence.isSig == 1))), 1))
+
+ggplot() +
+      geom_sf(data = final_net, aes(fill=gunviolence.isSig.dist), colour=NA) +
+      scale_fill_viridis(option = "viridis", name="NN Distance") +
+      labs(title="Gun Violence NN Distance") +
+      theme(axis.text.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks =element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        plot.subtitle = element_text(size = 9,face = "italic"),
+        plot.title = element_text(size = 10, face = "bold"),
+        panel.background = element_blank(),
+        panel.border = element_rect(colour = "grey", fill=NA, size=0.8)
+        )
+```
+
+
+
+
+
+## All Risk Factors
+
+The first column of graphs illustrates the correlation between gun violence and the selected variable. The slopes of regression lines are all positive, representing that gun violence positively correlates with risk factors. The second column of graphs shows the correlation between gun violence and the distance to risk factors. The slopes of regression lines are all negative, representing that gun violence is negatively correlated with the distance to risk factors. The longer the distance to the risk factors, the fewer gun violence incidents happen.
+
+
+```{r cache = TRUE, warning = FALSE, message = FALSE,fig.width=10, fig.height=10}
+final_net_long <- final_net%>% 
+  st_drop_geometry() %>% 
+  dplyr::select(-c(uniqueID, cvID)) %>% 
+  pivot_longer(cols = -countgunviolence, # everything except measurement
+               names_to = "Type", # categorizes all quantitative variables into Type
+               values_to = "Number") 
+
+correlation.cor <-
+  final_net_long %>%
+    group_by(Type) %>%
+    summarize(correlation = cor(Number, countgunviolence, use = "complete.obs"))
+
+final_net_long %>%
+  ggplot(aes(x= Number, y = countgunviolence)) +
+  geom_point(size = 0.01, color = "#000004") +  
+  geom_text(data = correlation.cor, aes(label = paste("r =", round(correlation, 2))),
+            x=-Inf, y=Inf, vjust = 1.5, hjust = -.1, size=3) +
+  geom_smooth(method='lm', formula= y~x, lwd=0.5, se = FALSE, color = "orange") +
+  facet_wrap(~ Type, scales = "free", ncol = 2, labeller= labeller(Type = c(
+    `Abandoned_Buildings` = "Abandoned Buildings",
+    `Abandoned_Buildings.nn` = "Distance to Abandoned Buildings",
+    `Abandoned_Cars` = "Abandoned Cars",
+    `Abandoned_Cars.nn` = "Distance to Abandoned Cars",
+    `Pot_Holes` = "Pot holes",
+    `Pot_Holes.nn` = "Distance to Pot holes",
+    `Graffiti` = "Graffiti",
+    `Graffiti.nn` = "Distance to Graffiti",
+    `Liquor_Retail` = "Liquor Retail",
+    `Liquor_Retail.nn` = "Distance to Liquor Retail",
+    `gunviolence.isSig` = "Significant Gun Violence",
+    `gunviolence.isSig.dist` = "Distance to Significant Gun violence",
+    `Sanitation` = "Sanitation",
+    `Sanitation.nn` = "Distance to Sanitation",
+    `Shot_Spotter` = "Shot Spotter", 
+    `Shot_Spotter.nn` = "Distance to Shot Spotter",
+    `Street_Lights_Out` = "Street Light Out",
+    `Street_Lights_Out.nn` = "Distance to Broken Street Light")))  +
+  labs(title = "Scatter Plots of Predictor Variables",
+       caption = "Data: Chicago Data Portal") +
+  theme(plot.subtitle = element_text(size = 9,face = "italic"),
+        plot.title = element_text(size = 12, face = "bold"), 
+        axis.text.x=element_text(size=8),
+        axis.text.y=element_text(size=8), 
+        axis.title=element_text(size=10), 
+        panel.background = element_blank(),
+        panel.border = element_rect(colour = "grey", fill=NA, size=0.8))
+
+```
+
+
+
+# Poission Regression
+
+## Random K fold
+
+Random K-fold cross-validations were performed below; the first cross-validation contains distance to risk factors, and the second cross-validation has extra variables from Local Moran’s I. The random index is assigned using “cvID”.
+
+```{r cache = TRUE, warning = FALSE, message = FALSE,results='hide'}
+reg.vars <- c("Abandoned_Buildings.nn", "Abandoned_Cars.nn", "Graffiti.nn", 
+              "Liquor_Retail.nn", "Street_Lights_Out.nn", "Sanitation.nn", 
+              "Shot_Spotter.nn", "Pot_Holes.nn")
+
+reg.ss.vars <- c("Abandoned_Buildings.nn", "Abandoned_Cars.nn", "Graffiti.nn", 
+                 "Liquor_Retail.nn", "Street_Lights_Out.nn", "Sanitation.nn", 
+                 "Shot_Spotter.nn", "Pot_Holes.nn", "gunviolence.isSig", "gunviolence.isSig.dist")
+
+reg.cv <- crossValidate(
+  dataset = final_net,
+  id = "cvID",
+  dependentVariable = "countgunviolence",
+  indVariables = reg.vars) %>%
+    dplyr::select(cvID = cvID, countgunviolence, Prediction, geometry)
+
+reg.ss.cv <- crossValidate(
+  dataset = final_net,
+  id = "cvID",
+  dependentVariable = "countgunviolence",
+  indVariables = reg.ss.vars) %>%
+    dplyr::select(cvID = cvID, countgunviolence, Prediction, geometry)
+
+```
+
+## Spatial LOGO CV
+
+Spatial LOGO cross-validations were also performed, similar to the Random K-fold CV above, and spatial process variables were separated. LOGO stands for “Leave-one-group-out”,  for each iteration, one group is used as the test set while the remaining groups are used as the training set. Ensuring that the training and testing sets are sufficiently independent, especially in cases where there might be high correlation or similarity within groups.
+
+
+```{r cache = TRUE, warning = FALSE, message = FALSE,results='hide'}
+neighborhoods <- 
+  st_read("https://raw.githubusercontent.com/blackmad/neighborhoods/master/chicago.geojson") %>%
+  st_transform(st_crs(fishnet)) 
+
+final_net <-
+  st_centroid(final_net) %>%
+    st_join(dplyr::select(neighborhoods, name)) %>%
+      st_drop_geometry() %>%
+      left_join(dplyr::select(final_net, geometry, uniqueID)) %>%
+      st_sf() %>%
+  na.omit()
+
+reg.spatialCV <- crossValidate(
+  dataset = final_net,
+  id = "name",
+  dependentVariable = "countgunviolence",
+  indVariables = reg.vars) %>%
+    dplyr::select(cvID = name, countgunviolence, Prediction, geometry)
+
+reg.ss.spatialCV <- crossValidate(
+  dataset = final_net,
+  id = "name",
+  dependentVariable = "countgunviolence",
+  indVariables = reg.ss.vars) %>%
+    dplyr::select(cvID = name, countgunviolence, Prediction, geometry)
+```
+
+## Error Analysis
+
+The table below shows each cross-validation's Mean Absolute Error and Standard Deviation Mean Absolute Error results. In all, the Random k-fold performs better than the Spatial LOCO-CV, which has a smaller MAE and smaller SDMAE. Adding spatial process seems to enhance the model.
+
+
+
+```{r cache = TRUE, warning = FALSE, message = FALSE}
+reg.summary <- 
+  rbind(
+    mutate(reg.cv,           Error = Prediction - countgunviolence,
+                             Regression = "Random k-fold CV: Just Risk Factors"),
+                             
+    mutate(reg.ss.cv,        Error = Prediction - countgunviolence,
+                             Regression = "Random k-fold CV: Spatial Process"),
+    
+    mutate(reg.spatialCV,    Error = Prediction - countgunviolence,
+                             Regression = "Spatial LOGO-CV: Just Risk Factors"),
+                             
+    mutate(reg.ss.spatialCV, Error = Prediction - countgunviolence,
+                             Regression = "Spatial LOGO-CV: Spatial Process")) %>%
+    st_sf()
+```
+
+
+```{r cache = TRUE, warning = FALSE, message = FALSE}
+error_by_reg_and_fold <- 
+  reg.summary %>%
+    group_by(Regression, cvID) %>% 
+    summarize(Mean_Error = mean(Prediction - countgunviolence, na.rm = T),
+              MAE = mean(abs(Mean_Error), na.rm = T),
+              SD_MAE = mean(abs(Mean_Error), na.rm = T)) %>% ungroup()
+
+st_drop_geometry(error_by_reg_and_fold) %>%
+  group_by(Regression) %>% 
+    summarize(Mean_MAE = round(mean(MAE), 2),
+              SD_MAE = round(sd(MAE), 2)) %>%
+  kable(col.name=c("Regression", 'Mean Absolute Error','Standard Deviation MAE')) %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+    row_spec(2, color = "black", background = "#FCFFA4") %>%
+    row_spec(4, color = "black", background = "#FCFFA4") 
+```
+
+
+
+In Random K-fold’s maps, the errors are distributed randomly across the entire city of Chicago, whereas the errors in spatial LOGO-CV’s maps are concentrated in the hot spot that is discovered above.
+
+
+```{r cache = TRUE, warning = FALSE, message = FALSE}
+error_by_reg_and_fold %>% 
+  ggplot() +
+  geom_sf(aes(fill=MAE), color="transparent") +
+  scale_fill_viridis(option = "viridis", direction = -1) + 
+  facet_wrap(~Regression, ncol = 4) +
+   labs(title = "MAE by Fold and Regression",
+       caption = "Data: Chicago Data Portal") +
+  theme(legend.position = "bottom",
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank(),
+        plot.subtitle = element_text(size = 9,face = "italic"),
+        plot.title = element_text(size = 12, face = "bold"),
+        panel.background = element_blank(),
+        panel.border = element_rect(colour = "grey", fill=NA, size=0.8),
+        strip.text = element_text(size = 7)) 
+```
+
+
+
+# Prediction Accuracy
+
+## Generalizability Test
+
+In order to perform a generalizability test, Tidycensus is introduced to create a race context. The following plot shows the percentage of minorities for each census tract. We could see that the majority of white people lived in the northwest and northeast parts of the city, whereas central and south parts of the city were minorities.
+
+The mean error distribution is similar to what we have generated above, with random k-fold being better than spatial LOGO. Also, adding spatial process lowers the mean error, meaning that the models perform better with spatial process variables. The majority of white errors are higher than the minorities, which indicates the models are well performed under the racial context.
+
+
+```{r cache = TRUE, warning = FALSE, message = FALSE,results='hide'}
+
+tracts18 <- 
+  get_acs(geography = "tract", 
+          variables = c("B02001_001E", # total population
+            "B02001_002E", # white population
+            "B02001_003E", # black population
+            "B02001_005E", # asian population
+            "B03002_012E"), 
+          year=2018, state=17, county=031, 
+          geometry=TRUE, output="wide") %>%
+  st_transform('ESRI:102271') %>% 
+  rename(TotalPop = B02001_001E, 
+         Whites = B02001_002E,
+         African_Americans = B02001_003E,
+         Asians = B02001_005E,
+         Latinx = B03002_012E) %>% 
+  mutate(pctMinority = ifelse(TotalPop > 0, (African_Americans + Asians + Latinx ) / TotalPop, 0), 
+         majority = ifelse(pctMinority > 0.5, "minority", "majority")) %>%   .[neighborhoods,]
+
+```
+
+```{r cache = TRUE, warning = FALSE, message = FALSE}
+
+
+ggplot() + geom_sf(data = na.omit(tracts18), aes(fill = majority), color = "grey") +
+    scale_fill_manual(values = c("yellow", "#56106E"), name="Race Context") +
+    labs(title = "Race Context ",
+         caption = "Data: American Community Survey 2018") +
+  theme(
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank(),
+        plot.title = element_text(size = 12, face = "bold"),
+        panel.background = element_blank(),
+        panel.border = element_rect(colour = "grey", fill=NA, size=0.4)
+        ) 
+```
+
+
+```{r cache = TRUE, warning = FALSE, message = FALSE}
+joinrace <- st_centroid(reg.summary) %>% 
+  st_intersection(tracts18 %>%dplyr:: select(pctMinority)) %>% 
+  st_drop_geometry() %>% 
+  group_by(cvID) %>% 
+  summarize(meanMinor = mean(pctMinority))
+
+
+reg.summary <- reg.summary %>% 
+  left_join(joinrace, by = "cvID") 
+
+
+reg.summary %>% 
+  mutate(raceContext = ifelse(meanMinor > .6, "Minority", "Majority White")) %>% 
+  st_drop_geometry() %>% 
+  group_by(Regression, raceContext) %>%
+  summarize(mean.Error = mean(Error, na.rm = T)) %>%
+  spread(raceContext, mean.Error) %>%
+  kable() %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+    row_spec(2, color = "black", background = "#FCFFA4") %>%
+    row_spec(4, color = "black", background = "#FCFFA4") 
+```
+
+
+
+
+## Kernel Density Estimation
+
+Kernel Density is a smoothing method using a radius of 1000ft to scan over every grid cell.
+The result of the kernel density estimation is similar to the hot spot map, which indicates the same spatial distribution trend of gun violence incidents. The same process is performed as above. Instead of counting gun violence incidents, we classified 5 risk categories. 
+
+
+```{r cache = TRUE, warning = FALSE, message = FALSE}
+gun_ppp <- as.ppp(st_coordinates(gun18), W = st_bbox(final_net))
+gun_KD.1000 <- spatstat.explore::density.ppp(gun_ppp, 1000)
+gun_KD.df <- data.frame(rasterToPoints(mask(raster(gun_KD.1000), as(neighborhoods, 'Spatial'))))
+
+
+ggplot(data=gun_KD.df, aes(x=x, y=y)) +
+  geom_raster(aes(fill=layer)) + 
+  coord_sf(crs=st_crs(final_net)) + 
+  scale_fill_viridis(option = "viridis", name="Density") +
+  labs(title = "Kernel Density of Gun Violence 1000ft Radii") +
+    theme(axis.text.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks =element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        plot.subtitle = element_text(size = 9,face = "italic"),
+        plot.title = element_text(size = 12, face = "bold"),
+        panel.background = element_blank(),
+        panel.border = element_rect(colour = "grey", fill=NA, size=0.8)
+        )
+```
+
+
+A new metric for evaluating goodness of fit is introduced to assess whether the 2018 kernel density estimations or the risk predictions more accurately reflect the distribution of 2019 gun violence.
+
+```{r cache = TRUE, warning = FALSE, message = FALSE}
+# Read the CSV file into an R data frame
+crime_data19 <- read.csv("C:/Users/jiahangl/OneDrive - PennO365/MUSA508/A4/crime2019.csv")
+crime_data19 <- crime_data19 %>%
+  filter(!is.na(Longitude) & !is.na(Latitude))
+
+# Convert the data frame to an sf object, specifying longitude and latitude for coordinates
+# Assuming your CSV has columns named Longitude and Latitude
+gun19 <- st_as_sf(crime_data19, coords = c("Longitude", "Latitude"), crs = 4326)%>%
+st_transform('ESRI:102271')
+```
+
+
+The kernel density estimation was segmented into five risk levels, and the occurrences of 2019 gun violence were compiled within the same spatial framework. This evaluation aims to determine if the risk prediction model is more effective in capturing observed burglaries compared to the kernel density approach. A superior performance by the risk prediction model would signify its effectiveness as a more reliable tool for directing police resources.
+
+```{r cache = TRUE, warning = FALSE, message = FALSE}
+
+gun_KDE_sum <- as.data.frame(gun_KD.1000) %>%
+  st_as_sf(coords = c("x", "y"), crs = st_crs(final_net)) %>%
+  aggregate(., final_net, mean) 
+kde_breaks <- classIntervals(gun_KDE_sum$value, 
+                             n = 5, "fisher")
+gun_KDE_sf <- gun_KDE_sum %>%
+  mutate(label = "Kernel Density",
+         Risk_Category = classInt::findCols(kde_breaks),
+         Risk_Category = case_when(
+           Risk_Category == 5 ~ "5th",
+           Risk_Category == 4 ~ "4th",
+           Risk_Category == 3 ~ "3rd",
+           Risk_Category == 2 ~ "2nd",
+           Risk_Category == 1 ~ "1st")) %>%
+  cbind(
+    aggregate(
+      dplyr::select(gun18) %>% mutate(guncount = 1), ., sum) %>%
+    mutate(guncount = replace_na(guncount, 0))) %>%
+  dplyr::select(label, Risk_Category, guncount)
+```
+
+
+This assessment was similarly conducted for the risk prediction. It is important to note that the analysis includes comparisons of predictions from the LOGO-CV method both with and without incorporating spatial data.
+
+```{r cache = TRUE, warning = FALSE, message = FALSE}
+ml_breaks <- classIntervals(reg.ss.spatialCV$Prediction, 
+                             n = 5, "fisher")
+gun_risk_sf <-
+  reg.ss.spatialCV %>%
+  mutate(label = "Risk Predictions Spatial",
+         Risk_Category =classInt::findCols(ml_breaks),
+         Risk_Category = case_when(
+           Risk_Category == 5 ~ "5th",
+           Risk_Category == 4 ~ "4th",
+           Risk_Category == 3 ~ "3rd",
+           Risk_Category == 2 ~ "2nd",
+           Risk_Category == 1 ~ "1st")) %>%
+  cbind(
+    aggregate(
+      dplyr::select(gun19) %>% mutate(guncount = 1), ., sum) %>%
+      mutate(guncount = replace_na(guncount, 0))) %>%
+  dplyr::select(label,Risk_Category, guncount)
+
+ml_breaks_simple <- classIntervals(reg.ss.cv$Prediction, 
+                             n = 5, "fisher")
+gun_risk_sf_simple <-
+  reg.ss.cv %>%
+  mutate(label = "Risk Predictions Simple",
+         Risk_Category =classInt::findCols(ml_breaks_simple),
+         Risk_Category = case_when(
+           Risk_Category == 5 ~ "5th",
+           Risk_Category == 4 ~ "4th",
+           Risk_Category == 3 ~ "3rd",
+           Risk_Category == 2 ~ "2nd",
+           Risk_Category == 1 ~ "1st")) %>%
+  cbind(
+    aggregate(
+      dplyr::select(gun19) %>% mutate(guncount = 1), ., sum) %>%
+      mutate(guncount = replace_na(guncount, 0))) %>%
+  dplyr::select(label,Risk_Category, guncount)
+```
+
+## Prediction Comparison
+
+Comparison maps are generated below, with the same characteristics of previous maps that hot spots have the highest risk categories. The histogram below illustrates the percentage of gun violence captured by different models in terms of risk categories. For the first, second, and third categories, the prediction models with spatial progress capture a higher percentage of gun violence incidents in 2019. For the fourth and fifth risk categories, the kernel density stands out as capturing a higher percentage of gun violence incidents.
+
+
+```{r cache = TRUE, warning = FALSE, message = FALSE}
+rbind(gun_KDE_sf, gun_risk_sf, gun_risk_sf_simple) %>%
+  na.omit() %>%
+  gather(Variable, Value, -label, -Risk_Category, -geometry) %>%
+  ggplot() +
+    geom_sf(aes(fill = Risk_Category), colour = NA) +
+    facet_wrap(~label, ) +
+    scale_fill_viridis(option = "viridis", discrete = TRUE, name = "Risk Category") +
+      geom_sf(data = sample_n(gun19, 3000), size = .03, colour = "white") +
+    labs(title="Comparison of Kernel Density and Risk Predictions",
+         subtitle="2018 gun violence risk predictions; 2019 Gun Violence") + 
+  theme(axis.text.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks =element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        plot.subtitle = element_text(size = 9,face = "italic"),
+        plot.title = element_text(size = 12, face = "bold"),
+        panel.background = element_blank(),
+        panel.border = element_rect(colour = "grey", fill=NA, size=0.8)
+        )
+```
+
+```{r cache = TRUE, warning = FALSE, message = FALSE}
+rbind(gun_KDE_sf, gun_risk_sf, gun_risk_sf_simple) %>%
+  st_drop_geometry() %>%
+  na.omit() %>%
+  gather(Variable, Value, -label, -Risk_Category) %>%
+  group_by(label, Risk_Category) %>%
+  summarize(countgunviolence = sum(Value)) %>%
+  ungroup() %>%
+  group_by(label) %>%
+  mutate(Pcnt_of_test_set_crimes = countgunviolence / sum(countgunviolence)) %>%
+    ggplot(aes(Risk_Category,Pcnt_of_test_set_crimes)) +
+      geom_bar(aes(fill=label), position="dodge", stat="identity") +
+      scale_fill_viridis(option = "viridis", discrete = TRUE, name = "Model", direction = -1) +
+      labs(title = "Risk Prediction vs. Kernel Density",
+           y = "% of Test Set Gun Violence (per model)",
+           x = "Risk Category") +
+  theme_bw() +
+      theme(axis.text.x = element_text(angle = 45, vjust = 0.5))
+```
+
+# Conclusion
+
+To conclude, I would recommend to use the model considering the spatial process for further predictive policing tasks. Compared with the model considering only risk factors including abandoned cars, street lights out, graffiti remediation, sanitation complaints, abandon buildings, location of retail stores that sell liquor to go, location of shotspotter, and location of potholes, the spatial process model has lower MAE, suggesting that it has more accuracy. 
+
+However, there are some limitations. Comparing to the traditional methodology of using kernel density to estimate crime locations, our model did not do very well in capturing gun violence crime in areas designated as the highest risk category. However, it does better in lower risk category. There are several potential reasons behind. Firstly, our model focuses on physical features without sufficient consideration of socio eonomic factors such as income,education level, and housing instability, at neighborhood level. High-crime areas often have complex, intertwined socio-economic factors that contribute to the elevated risk. Meanwhile, the data distribution and volume may be another problem. In many urban areas, crimes are disproportionately distributed, with a majority of neighborhoods experiencing low to moderate crime rates and a few areas experiencing very high crime rates. This uneven distribution can lead to models being better trained to predict lower crime rates simply because there is more data representing these conditions, leading to higher accuracy in these categories. This leads us to think about whether using a single model is not enough to capture the complexities of gun violence distribution patterns. Last but not least, there can be a bias in crime data due to differences in crime reporting rates and police deployment strategies across neighborhoods. Lower-risk areas might have higher reporting rates and different police presence compared to high-risk areas, affecting the quality and quantity of data the model is trained on. This discrepancy can lead to models being less accurate in predicting crime in high-risk areas if these biases are not accounted for.
+
+In moving forward, the adoption of a more holistic approach that combines spatial analysis with insights into socioeconomic conditions, while also recognizing data collection biases, may yield a more comprehensive and effective tool for predictive policing. Such an approach promises not only to enhance the precision of crime predictions but also to address the complexities and varied nature of urban crime landscapes in a more informed manner.
+
+
+
